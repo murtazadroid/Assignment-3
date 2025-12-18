@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs & runs
+runs/
+logs/
+*.log
+
+# Models (optional: keep only small test models)
+models/*.zip
+
+# Colab / Jupyter
+.ipynb_checkpoints/
+
+# Data (if large)
+data/

@@ -14,7 +14,11 @@ class KalshiBTCHourlyEnv(gym.Env):
     - One episode = one day (9:00 to 23:00)
     - Each step = one hourly Kalshi-style event
     - Action space: 0=hold, 1=buy 1 YES, 2=sell 1 YES
+    - Position is settled and reset to 0 after each event (no carryover)
     - Reward = change in portfolio value - small trading penalty
+
+    NOTE (toy setup): threshold is generated using resolve_price as a center (future-leaky),
+    but randomized so payoff is not always 1.
     """
 
     metadata = {"render_modes": ["human"]}
@@ -25,6 +29,7 @@ class KalshiBTCHourlyEnv(gym.Env):
         start_balance: float = 10_000.0,
         fee_per_contract: float = 0.001,
         spread: float = 0.02,
+        threshold_band: float = 0.01,  # +/-1% around resolve price
         render_mode: Optional[str] = None,
     ):
         super().__init__()
@@ -33,7 +38,11 @@ class KalshiBTCHourlyEnv(gym.Env):
         self.start_balance = start_balance
         self.fee_per_contract = fee_per_contract
         self.spread = spread
+        self.threshold_band = threshold_band
         self.render_mode = render_mode
+
+        # RNG (set in reset(seed=...))
+        self.rng = np.random.default_rng()
 
         # Episode-level state
         self.current_day_idx: int = 0
@@ -44,32 +53,29 @@ class KalshiBTCHourlyEnv(gym.Env):
         self.num_events = len(self.event_hours)
         self.current_step_idx: int = 0
 
-        # Simple portfolio: cash + YES position
+        # Portfolio state
         self.cash: float = self.start_balance
-        self.position_yes: int = 0
+        self.position_yes: int = 0  # will be settled to 0 each step
         self.unrealized_pnl: float = 0.0
         self.prev_portfolio_value: float = self.start_balance
 
-        # For each hour, we store a threshold and the resolve price
+        # Precomputed per-event values
         self.thresholds: List[float] = []
         self.resolve_prices: List[float] = []
 
-        # RL interface: action & observation spaces
-        # Actions: 0=hold, 1=buy 1 YES, 2=sell 1 YES
+        # RL interface
         self.action_space = spaces.Discrete(3)
 
         # Observation: 11 features (floats)
         obs_low = np.array([-np.inf] * 11, dtype=np.float32)
         obs_high = np.array([np.inf] * 11, dtype=np.float32)
-        self.observation_space = spaces.Box(
-            low=obs_low, high=obs_high, dtype=np.float32
-        )
+        self.observation_space = spaces.Box(low=obs_low, high=obs_high, dtype=np.float32)
 
     # ------------------------------------------------------------------
     # Helper: select day and precompute thresholds + resolve prices
     # ------------------------------------------------------------------
     def _reset_day(self):
-        self.current_day_idx = np.random.randint(0, len(self.day_data_list))
+        self.current_day_idx = self.rng.integers(0, len(self.day_data_list))
         self.current_day_df = self.day_data_list[self.current_day_idx]
 
         self.thresholds = []
@@ -77,12 +83,14 @@ class KalshiBTCHourlyEnv(gym.Env):
 
         for hour in self.event_hours:
             resolve_time = self._get_timestamp_for_hour(hour)
-            price_at_resolve = self._get_price_at_time(resolve_time)
-            self.resolve_prices.append(price_at_resolve)
+            resolve_price = self._get_price_at_time(resolve_time)
+            self.resolve_prices.append(resolve_price)
 
-            # Simple threshold: 0.5% below resolve price
-            threshold = price_at_resolve * 0.995
-            self.thresholds.append(threshold)
+            # Toy threshold: resolve_price is "mid", choose random threshold around it
+            # threshold = resolve_price * (1 + u), u ~ Uniform(-band, +band)
+            u = self.rng.uniform(-self.threshold_band, self.threshold_band)
+            threshold = resolve_price * (1.0 + u)
+            self.thresholds.append(float(threshold))
 
     def _get_timestamp_for_hour(self, hour: int) -> pd.Timestamp:
         date = self.current_day_df.index[0].date()
@@ -110,6 +118,9 @@ class KalshiBTCHourlyEnv(gym.Env):
     # ------------------------------------------------------------------
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
+        if seed is not None:
+            self.rng = np.random.default_rng(seed)
+
         self._reset_day()
         self.current_step_idx = 0
 
@@ -119,7 +130,7 @@ class KalshiBTCHourlyEnv(gym.Env):
         self.prev_portfolio_value = self.start_balance
 
         obs = self._get_observation()
-        info = {}
+        info = {"portfolio_value": self.prev_portfolio_value}
         return obs, info
 
     def step(self, action: int):
@@ -137,7 +148,7 @@ class KalshiBTCHourlyEnv(gym.Env):
         yes_midprice = self._simulate_yes_midprice(current_price, threshold)
         bid, ask = self._get_bid_ask(yes_midprice)
 
-        # --- Execute action ---
+        # --- Execute action (no shorting) ---
         trade_size = 0
         if action == 1:  # buy 1 YES at ask
             cost = ask + self.fee_per_contract
@@ -145,24 +156,29 @@ class KalshiBTCHourlyEnv(gym.Env):
                 self.cash -= cost
                 self.position_yes += 1
                 trade_size = 1
-        elif action == 2:  # sell 1 YES at bid
-            # allow short for now
-            self.cash += bid - self.fee_per_contract
-            self.position_yes -= 1
-            trade_size = -1
+        elif action == 2:  # sell 1 YES at bid (only if holding)
+            if self.position_yes >= 1:
+                self.cash += bid - self.fee_per_contract
+                self.position_yes -= 1
+                trade_size = -1
 
         # --- Resolve event at the hour ---
         resolve_price = self.resolve_prices[self.current_step_idx]
         payoff_yes = 1.0 if resolve_price > threshold else 0.0
 
-        # After resolution, assume all YES exposure is immediately valued at payoff
-        portfolio_value = self.cash + self.position_yes * payoff_yes
+        # --- Settle & clear position after each event ---
+        # Any remaining YES position resolves to cash immediately.
+        if self.position_yes != 0:
+            self.cash += self.position_yes * payoff_yes
+            self.position_yes = 0
+
+        portfolio_value = self.cash
 
         # Reward = change in portfolio value - small penalty for trading
         trade_penalty = 0.001 * abs(trade_size)
         reward = (portfolio_value - self.prev_portfolio_value) - trade_penalty
         self.prev_portfolio_value = portfolio_value
-        self.unrealized_pnl = 0.0  # we "settle" this event
+        self.unrealized_pnl = 0.0
 
         # Move to next hour
         self.current_step_idx += 1
@@ -172,9 +188,14 @@ class KalshiBTCHourlyEnv(gym.Env):
         obs = self._get_observation()
         info = {
             "hour": hour,
-            "threshold": threshold,
-            "resolve_price": resolve_price,
-            "portfolio_value": portfolio_value,
+            "threshold": float(threshold),
+            "resolve_price": float(resolve_price),
+            "payoff_yes": float(payoff_yes),
+            "yes_midprice": float(yes_midprice),
+            "bid": float(bid),
+            "ask": float(ask),
+            "trade_size": int(trade_size),
+            "portfolio_value": float(portfolio_value),
         }
         return obs, reward, terminated, truncated, info
 
@@ -182,6 +203,7 @@ class KalshiBTCHourlyEnv(gym.Env):
     # Observation builder
     # ------------------------------------------------------------------
     def _get_observation(self) -> np.ndarray:
+        # Use a safe index when episode is done
         hour_idx = min(self.current_step_idx, self.num_events - 1)
         hour = self.event_hours[hour_idx]
         threshold = self.thresholds[hour_idx]
@@ -191,7 +213,7 @@ class KalshiBTCHourlyEnv(gym.Env):
 
         r_5m, r_15m, r_60m, vol_30m = self._compute_price_features(decision_time)
 
-        time_to_event = 5.0 / 60.0  # we always decide 5min before
+        time_to_event = 5.0 / 60.0  # always decide 5 min before
         moneyness = (current_price - threshold) / max(threshold, 1e-6)
 
         yes_midprice = self._simulate_yes_midprice(current_price, threshold)
@@ -254,8 +276,7 @@ class KalshiBTCHourlyEnv(gym.Env):
     def render(self):
         if self.render_mode == "human":
             print(
-                f"Step {self.current_step_idx}, cash={self.cash:.2f}, "
-                f"pos_yes={self.position_yes}"
+                f"Step {self.current_step_idx}, cash={self.cash:.4f}, pos_yes={self.position_yes}"
             )
 
     def close(self):
