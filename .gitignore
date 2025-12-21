@@ -1,26 +1,63 @@
+# ===============================
 # Python
+# ===============================
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
-
-# Virtual environments
-.venv/
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+.env
+.venv
 venv/
 
+# ===============================
+# Jupyter / Colab
+# ===============================
+.ipynb_checkpoints/
+*.ipynb
+
+# ===============================
 # OS files
+# ===============================
 .DS_Store
 Thumbs.db
 
-# Logs & runs
-runs/
-logs/
+# ===============================
+# Logs
+# ===============================
 *.log
 
-# Models (optional: keep only small test models)
-models/*.zip
+# ===============================
+# Model artifacts (DO NOT COMMIT)
+# ===============================
+models/*
+!models/.gitkeep
 
-# Colab / Jupyter
-.ipynb_checkpoints/
+# ===============================
+# TensorBoard / Training runs
+# ===============================
+runs/
+tb/
+wandb/
 
-# Data (if large)
+# ===============================
+# Large data / generated data
+# ===============================
 data/
+*.csv
+*.parquet
+*.h5
+
+# ===============================
+# Colab / Drive mounts
+# ===============================
+content/
+drive/
+
+# ===============================
+# Temporary files
+# ===============================
+tmp/
+temp/
